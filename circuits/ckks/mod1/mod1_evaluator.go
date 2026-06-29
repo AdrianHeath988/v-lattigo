@@ -8,6 +8,7 @@ import (
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/polynomial"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
+	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 	"github.com/tuneinsight/lattigo/v6/utils/bignum"
 )
@@ -18,6 +19,47 @@ type Evaluator struct {
 	*ckks.Evaluator
 	PolynomialEvaluator *polynomial.Evaluator
 	Parameters          Parameters
+
+	// vFHE trace capture (set by the bootstrapping evaluator only during EvalMod):
+	// when non-nil, EvaluateAndScaleNew emits each top-level step's operand/result.
+	TraceSink ring.TraceSink
+	TraceStep int
+}
+
+// mod1PrefixSink wraps a TraceSink with a region prefix, so the double-angle
+// rescale (RescaleTraced emits operand/intt/advice/divround/ntt/result) lands
+// under "rs_*" keys the runtime drains via flushRescale — the same proven
+// streamed-rescale path the homomorphic DFT (CoeffsToSlots) per-step rescale uses.
+type mod1PrefixSink struct {
+	inner  ring.TraceSink
+	prefix string
+}
+
+func (p mod1PrefixSink) Poly(region string, idx int, vals []uint64) {
+	p.inner.Poly(p.prefix+region, idx, vals)
+}
+func (p mod1PrefixSink) Stage(region string, idx, stage int, vals []uint64) {
+	p.inner.Stage(p.prefix+region, idx, stage, vals)
+}
+
+// emitEvalModStep emits one EvalMod step (operand + result ciphertexts) under
+// region prefix "evalmod_". `kind` tags the op (offset/poly/dbl-angle/arcsine).
+func emitEvalModStep(sink ring.TraceSink, step int, kind uint64, operand, result *rlwe.Ciphertext) {
+	if sink == nil || operand == nil {
+		return
+	}
+	level := result.Level()
+	ctSize := len(result.Value)
+	opLevel := operand.Level()
+	sink.Poly("evalmod_meta", step, []uint64{uint64(level), uint64(ctSize), kind, uint64(opLevel)})
+	for k := 0; k < ctSize; k++ {
+		for i := 0; i <= opLevel; i++ {
+			sink.Poly("evalmod_operand", (step*8+k)*64+i, append([]uint64{}, operand.Value[k].Coeffs[i]...))
+		}
+		for i := 0; i <= level; i++ {
+			sink.Poly("evalmod_result", (step*8+k)*64+i, append([]uint64{}, result.Value[k].Coeffs[i]...))
+		}
+	}
 }
 
 // NewEvaluator instantiates a new [Evaluator] evaluator from [ckks.Evaluator].
@@ -45,6 +87,25 @@ func (eval Evaluator) EvaluateAndScaleNew(ct *rlwe.Ciphertext, scaling complex12
 	// Normalize the modular reduction to mod by 1 (division by Q)
 	res.Scale = evm.ScalingFactor()
 
+	// vFHE: per-step EvalMod trace capture. snap() copies the current operand;
+	// emit() records (operand, res) for the just-completed step. kind tags the op:
+	// 0=offset-add, 1=Chebyshev poly-eval, 2=double-angle iteration, 3=arcsine.
+	tstep := 0
+	snap := func() *rlwe.Ciphertext {
+		if eval.TraceSink != nil {
+			return res.CopyNew()
+		}
+		return nil
+	}
+	emit := func(kind uint64, operand *rlwe.Ciphertext) {
+		if eval.TraceSink != nil {
+			// eval.TraceStep is a per-call base offset (set by the bootstrapping
+			// EvalMod) so the ctReal/ctImag EvalMod calls don't collide.
+			emitEvalModStep(eval.TraceSink, eval.TraceStep+tstep, kind, operand, res)
+			tstep++
+		}
+	}
+
 	// Compute the scales that the ciphertext should have before the double angle
 	// formula such that after it it has the scale it had before the polynomial
 	// evaluation
@@ -62,9 +123,16 @@ func (eval Evaluator) EvaluateAndScaleNew(ct *rlwe.Ciphertext, scaling complex12
 		offset := new(big.Float).Sub(&evm.Mod1Poly.B, &evm.Mod1Poly.A)
 		offset.Mul(offset, new(big.Float).SetFloat64(evm.IntervalShrinkFactor()))
 		offset.Quo(new(big.Float).SetFloat64(-0.5), offset)
+		o := snap()
 		if err = eval.Add(res, offset, res); err != nil {
 			return nil, fmt.Errorf("cannot Evaluate: %w", err)
 		}
+		var offRef [][]uint64
+		if eval.TraceSink != nil && o != nil { // bind offset to the public constant (hole 1)
+			offRef = scalarRefPlain(eval.Evaluator, o.Level(), o.Scale, offset)
+		}
+		emitLinOp(eval.TraceSink, loPADD, o, nil, res, offRef) // offset change-of-variable
+		emit(0, o)
 	}
 
 	// Double angle
@@ -94,28 +162,76 @@ func (eval Evaluator) EvaluateAndScaleNew(ct *rlwe.Ciphertext, scaling complex12
 	}
 
 	// Chebyshev evaluation
-	if res, err = eval.PolynomialEvaluator.Evaluate(res, mod1Poly, rlwe.NewScale(targetScale)); err != nil {
+	pIn := snap()
+	// vFHE: capture the Chebyshev poly-eval's internal key-switches + rescales via the
+	// tracing decorator (no-op when not tracing); production path is unchanged.
+	if err = eval.withTracedPolyEval(func() (e error) {
+		res, e = eval.PolynomialEvaluator.Evaluate(res, mod1Poly, rlwe.NewScale(targetScale))
+		return
+	}); err != nil {
 		return nil, fmt.Errorf("cannot Evaluate: %w", err)
 	}
+	emit(1, pIn)
 
 	for i := 0; i < evm.DoubleAngle; i++ {
+		dIn := snap()
+
+		// vFHE: capture the double-angle square+relin as a streamed multi-P
+		// key-switch proof, WITHOUT perturbing the production MulRelin below. We
+		// RECOMPUTE the identical square (dIn·dIn, the same product MulRelin forms)
+		// and relinearize it through the instrumented multi-P path into a throwaway
+		// ciphertext; the runtime drains the "rl_*" regions on the trailing "rl_meta".
+		// Recompute (not split) keeps the numerically-sensitive bootstrap path exact.
+		if eval.TraceSink != nil && len(eval.GetParameters().P()) >= 2 && dIn != nil && dIn.Level() >= 1 {
+			if prod, e := eval.MulNew(dIn, dIn); e == nil && prod.Degree() == 2 {
+				// square tensor (MUL: prod = dIn⊗dIn) + its relin (multi-P key-switch).
+				emitLinOp(eval.TraceSink, loMUL, dIn, dIn, prod, nil)
+				tmp := ckks.NewCiphertext(*eval.GetParameters(), 1, dIn.Level())
+				if L, nP, d, e2 := eval.RelinearizeMultiPTraced(prod, tmp,
+					mod1PrefixSink{inner: eval.TraceSink, prefix: "rl_"}); e2 == nil {
+					eval.TraceSink.Poly("rl_meta", 0, []uint64{
+						uint64(eval.GetParameters().N()), uint64(L), uint64(nP), uint64(d)})
+				}
+			}
+		}
+
 		sqrt2pi *= sqrt2pi
 
 		if err = eval.MulRelin(res, res, res); err != nil {
 			return nil, fmt.Errorf("cannot Evaluate: %w", err)
 		}
+		stA := snap() // after square+relin (before doubling)
 
 		if err = eval.Add(res, res, res); err != nil {
 			return nil, fmt.Errorf("cannot Evaluate: %w", err)
 		}
+		stB := snap() // after doubling (= 2·stA)
+		emitLinOp(eval.TraceSink, loADD, stA, stA, stB, nil)
 
 		if err = eval.Add(res, -sqrt2pi, res); err != nil {
 			return nil, fmt.Errorf("cannot Evaluate: %w", err)
 		}
+		var saRef [][]uint64
+		if eval.TraceSink != nil && stB != nil { // bind −sqrt2pi to the public constant (hole 1)
+			saRef = scalarRefPlain(eval.Evaluator, stB.Level(), stB.Scale, complex128(-sqrt2pi))
+		}
+		emitLinOp(eval.TraceSink, loPADD, stB, nil, res, saRef) // const-add (= stB − sqrt2pi)
 
-		if err = eval.Rescale(res, res); err != nil {
+		// vFHE: capture the double-angle rescale as a streamed, SNARK-provable
+		// RESCALE op (reuses the proven RescaleTraced + flushRescale path). The
+		// runtime drains the "rs_*" regions on the trailing "rs_meta"; the 2-element
+		// meta [N, inLimbs] selects the plain rescale dump (no BSGS-step edge fields).
+		// Falls back to the untraced Rescale outside capture / multi-prime rescaling.
+		if eval.TraceSink != nil && eval.GetParameters().LevelsConsumedPerRescaling() == 1 && res.Level() >= 1 {
+			inLimbs := res.Level() + 1
+			if err = eval.RescaleTraced(res, res, mod1PrefixSink{inner: eval.TraceSink, prefix: "rs_"}); err != nil {
+				return nil, fmt.Errorf("cannot Evaluate (rescale traced): %w", err)
+			}
+			eval.TraceSink.Poly("rs_meta", 0, []uint64{uint64(eval.GetParameters().N()), uint64(inLimbs)})
+		} else if err = eval.Rescale(res, res); err != nil {
 			return nil, fmt.Errorf("cannot Evaluate: %w", err)
 		}
+		emit(2, dIn)
 	}
 
 	// ArcSine
@@ -133,9 +249,14 @@ func (eval Evaluator) EvaluateAndScaleNew(ct *rlwe.Ciphertext, scaling complex12
 			}
 		}
 
-		if res, err = eval.PolynomialEvaluator.Evaluate(res, mod1InvPoly, res.Scale); err != nil {
+		aIn := snap()
+		if err = eval.withTracedPolyEval(func() (e error) {
+			res, e = eval.PolynomialEvaluator.Evaluate(res, mod1InvPoly, res.Scale)
+			return
+		}); err != nil {
 			return nil, fmt.Errorf("cannot Evaluate: %w", err)
 		}
+		emit(3, aIn)
 	}
 
 	// Multiplies back by q

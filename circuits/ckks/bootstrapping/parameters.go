@@ -3,6 +3,7 @@ package bootstrapping
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -272,8 +273,37 @@ func NewParametersFromLiteral(residualParameters ckks.Parameters, btpLit Paramet
 	// Map to store [bit-size][]primes
 	primesNew := map[int][]uint64{}
 
+	if os.Getenv("HECATE_DUMP_BTPSCHED") == "1" {
+		fmt.Fprintf(os.Stderr, "[btpsched] LogQBootstrappingCircuit=%v\n", LogQBootstrappingCircuit)
+		fmt.Fprintf(os.Stderr, "[btpsched] LogP=%v\n", LogP)
+		fmt.Fprintf(os.Stderr, "[btpsched] primesBitLenNew=%v\n", primesBitLenNew)
+	}
+
 	// For each bit-size sample a pair-wise coprime prime
 	for logqi, k := range primesBitLenNew {
+
+		// vFHE fork: if a pinned catalog pool is provided for this bit-size, draw
+		// the stage primes from it (high-2-adicity, prover-bound) instead of
+		// auto-generating, so every chain prime is catalog-bound. Primes already
+		// in the residual (primesHave) are skipped; consumed in slice order.
+		if pool, ok := btpLit.StagePrimePool[logqi]; ok {
+			primes := make([]uint64, 0, k)
+			for _, qi := range pool {
+				if _, have := primesHave[qi]; have {
+					continue
+				}
+				primes = append(primes, qi)
+				primesHave[qi] = true
+				if len(primes) == k {
+					break
+				}
+			}
+			if len(primes) < k {
+				return Parameters{}, fmt.Errorf("cannot NewParametersFromLiteral: catalog StagePrimePool[%d] has %d usable primes, need %d", logqi, len(primes), k)
+			}
+			primesNew[logqi] = primes
+			continue
+		}
 
 		// Creates a new prime generator
 		/* #nosec G115 -- logqi cannot be negative */

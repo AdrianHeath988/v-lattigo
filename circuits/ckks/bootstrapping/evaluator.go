@@ -43,6 +43,11 @@ type Evaluator struct {
 
 	SkDebug *rlwe.SecretKey
 
+	// TraceSink, when set (vFHE proof capture), receives the per-stage proof
+	// trace of the bootstrap (currently the ModUp centered CRT lift). nil in
+	// normal operation -> zero overhead, behaviour unchanged.
+	TraceSink ring.TraceSink
+
 	pool *rlwe.BufferPool
 }
 
@@ -590,8 +595,46 @@ func (eval Evaluator) ScaleDown(ctIn *rlwe.Ciphertext) (*rlwe.Ciphertext, *rlwe.
 
 	scaleUpBigint := scaleUp.BigInt()
 
+	// vFHE: capture the ScaleDown public-scalar multiply (the new ScaleDown
+	// primitive; the prime-drop above is a trivial truncation and the RescaleTo
+	// below reuses the rescale gadget). Snapshot the operand before the in-place
+	// multiply; emit operand/scalar/result after. Relation proved downstream:
+	// result_i = (scalar mod q_i) * operand_i mod q_i.
+	var sdOperand [][]uint64
+	sdLevel := ctIn.Level()
+	if eval.TraceSink != nil {
+		Nn := r.N()
+		sdOperand = make([][]uint64, len(ctIn.Value)*(sdLevel+1))
+		for k := range ctIn.Value {
+			for i := 0; i <= sdLevel; i++ {
+				v := make([]uint64, Nn)
+				copy(v, ctIn.Value[k].Coeffs[i])
+				sdOperand[k*(sdLevel+1)+i] = v
+			}
+		}
+	}
+
 	if err := eval.Evaluator.Mul(ctIn, scaleUpBigint, ctIn); err != nil {
 		return nil, nil, err
+	}
+
+	if eval.TraceSink != nil {
+		Nn := r.N()
+		Qc := r.ModuliChain()
+		scalarRes := make([]uint64, Nn)
+		for i := 0; i <= sdLevel; i++ {
+			scalarRes[i] = new(big.Int).Mod(scaleUpBigint, new(big.Int).SetUint64(Qc[i])).Uint64()
+		}
+		eval.TraceSink.Poly("scaledown_scalar", 0, scalarRes)
+		eval.TraceSink.Poly("scaledown_meta", 0, []uint64{uint64(sdLevel), uint64(len(ctIn.Value))})
+		for k := range ctIn.Value {
+			for i := 0; i <= sdLevel; i++ {
+				eval.TraceSink.Poly("scaledown_operand", k*(sdLevel+1)+i, sdOperand[k*(sdLevel+1)+i])
+				rv := make([]uint64, Nn)
+				copy(rv, ctIn.Value[k].Coeffs[i])
+				eval.TraceSink.Poly("scaledown_result", k*(sdLevel+1)+i, rv)
+			}
+		}
 	}
 
 	ctIn.Scale = ctIn.Scale.Mul(rlwe.NewScale(scaleUpBigint))
@@ -650,21 +693,10 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 
 	N := ringQ.N()
 
-	// ModUp q->Q for ctIn[0] centered around q
-	for j := 0; j < N; j++ {
-
-		coeff = ctIn.Value[0].Coeffs[0][j]
-		pos, neg = 1, 0
-		if coeff >= (q >> 1) {
-			coeff = q - coeff
-			pos, neg = 0, 1
-		}
-
-		for i := 1; i < levelQ+1; i++ {
-			tmp = ring.BRedAdd(coeff, Q[i], BRCQ[i])
-			ctIn.Value[0].Coeffs[i][j] = tmp*pos + (Q[i]-tmp)*neg
-		}
-	}
+	// ModUp q->Q for ctIn[0] centered around q. Shared with ring.ModUpCentered,
+	// which performs the identical centered CRT lift and (when eval.TraceSink is
+	// set) emits the vFHE proof trace (operand/sign/lift) for component 0.
+	ringQ.ModUpCentered(0, levelQ, ctIn.Value[0].Coeffs[0], ctIn.Value[0], eval.TraceSink)
 
 	if eval.EvkSparseToDense != nil {
 
@@ -693,6 +725,42 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 				tmp = ring.BRedAdd(coeff, P[i], BRCP[i])
 				buffDecompQP[0].P.Coeffs[i][j] = tmp*pos + (P[i]-tmp)*neg
 			}
+		}
+
+		// vFHE: capture the V[1] centered CRT lift (q0 -> QP, the hoisted
+		// key-switch's mod-up input) before the in-place NTT below. Component 1
+		// uses STRICT '>' centering and lifts into every Q and P prime (incl. q0).
+		if eval.TraceSink != nil {
+			op1 := make([]uint64, N)
+			copy(op1, ctIn.Value[1].Coeffs[0])
+			sign1 := make([]uint64, N)
+			for j := 0; j < N; j++ {
+				if ctIn.Value[1].Coeffs[0][j] > (q >> 1) {
+					sign1[j] = 1
+				}
+			}
+			eval.TraceSink.Poly("modup_operand", 1, op1)
+			eval.TraceSink.Poly("modup_sign", 1, sign1)
+			for i := 0; i < levelQ+1; i++ {
+				v := make([]uint64, N)
+				copy(v, buffDecompQP[0].Q.Coeffs[i])
+				eval.TraceSink.Poly("modup_lift", 1*(levelQ+1)+i, v)
+			}
+			for i := 0; i < levelP+1; i++ {
+				v := make([]uint64, N)
+				copy(v, buffDecompQP[0].P.Coeffs[i])
+				eval.TraceSink.Poly("modup_liftP", i, v)
+			}
+			// vFHE NTT-tie: capture the per-stage forward NTT of each centered
+			// lift (coeff -> eval), so the prover binds eval_i = NTT(lift_i) via
+			// CT_NTT. Region indices ALIGN with the modup_lift/modup_liftP idxs:
+			//   V[0] Q : modup_ntt  idx = i              (comp 0, lifts 1..levelQ)
+			//   V[1] Q : modup_ntt  idx = (levelQ+1)+i   (comp 1, lifts 0..levelQ)
+			//   V[1] P : modup_nttP idx = i              (comp 1, P lifts 0..levelP)
+			// Captured BEFORE the in-place production NTTs below (lift still coeff).
+			ringQ.NTTLiftTraced(ctIn.Value[0], 1, levelQ, "modup_ntt", 0, eval.TraceSink)
+			ringQ.NTTLiftTraced(buffDecompQP[0].Q, 0, levelQ, "modup_ntt", levelQ+1, eval.TraceSink)
+			ringP.NTTLiftTraced(buffDecompQP[0].P, 0, levelP, "modup_nttP", 0, eval.TraceSink)
 		}
 
 		for i := len(buffDecompQP) - 1; i >= 0; i-- {
@@ -772,11 +840,30 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 
 // CoeffsToSlots applies the homomorphic decoding
 func (eval Evaluator) CoeffsToSlots(ctIn *rlwe.Ciphertext) (ctReal, ctImag *rlwe.Ciphertext, err error) {
+	// vFHE: scope the DFT trace capture to CoeffsToSlots (the dft() primitive is
+	// shared with SlotsToCoeffs, which runs after EvalMod and is out of scope).
+	if eval.TraceSink != nil {
+		eval.DFTEvaluator.TraceSink = eval.TraceSink
+		eval.DFTEvaluator.TraceStep = 0
+		eval.DFTEvaluator.TracePrefix = "c2s"
+		defer func() { eval.DFTEvaluator.TraceSink = nil }()
+	}
 	return eval.DFTEvaluator.CoeffsToSlotsNew(ctIn, eval.C2SDFTMatrix)
 }
 
 // EvalMod applies the homomorphic modular reduction by q.
 func (eval Evaluator) EvalMod(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err error) {
+	// vFHE: capture the EvalMod op stream. The base step offset is advanced by a
+	// fixed stride per call so the ctReal/ctImag EvalMod traces don't collide
+	// (reset to 0 by the runtime when the bootstrap sink is set).
+	if eval.TraceSink != nil {
+		eval.Mod1Evaluator.TraceSink = eval.TraceSink
+		base := eval.Mod1Evaluator.TraceStep
+		defer func() {
+			eval.Mod1Evaluator.TraceSink = nil
+			eval.Mod1Evaluator.TraceStep = base + 50
+		}()
+	}
 	if ctOut, err = eval.Mod1Evaluator.EvaluateNew(ctIn); err != nil {
 		return nil, err
 	}
@@ -797,6 +884,14 @@ func (eval Evaluator) EvalModAndScale(ctIn *rlwe.Ciphertext, scaling complex128)
 }
 
 func (eval Evaluator) SlotsToCoeffs(ctReal, ctImag *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err error) {
+	// vFHE: capture the SlotsToCoeffs DFT (same dft() primitive as CoeffsToSlots,
+	// distinguished by the "s2c" region prefix).
+	if eval.TraceSink != nil {
+		eval.DFTEvaluator.TraceSink = eval.TraceSink
+		eval.DFTEvaluator.TraceStep = 0
+		eval.DFTEvaluator.TracePrefix = "s2c"
+		defer func() { eval.DFTEvaluator.TraceSink = nil }()
+	}
 	return eval.DFTEvaluator.SlotsToCoeffsNew(ctReal, ctImag, eval.S2CDFTMatrix)
 }
 

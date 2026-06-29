@@ -139,6 +139,17 @@ type ParametersLiteral struct {
 	Mod1Degree                                  *int                        // Default: 30
 	DoubleAngle                                 *int                        // Default: 3
 	Mod1InvDegree                               *int                        // Default: 0
+
+	// StagePrimePool (vFHE fork extension): optional map bit-size -> pinned prime
+	// pool. When set, NewParametersFromLiteral draws the bootstrapping STAGE
+	// primes (CoeffsToSlots / EvalMod / SlotsToCoeffs / P) of that bit-size from
+	// this pool instead of auto-generating them, so every chain prime is a
+	// catalog prime the lattice-zkSNARK prover has a precompiled field for.
+	// Primes already in the residual chain are skipped; the pool must hold at
+	// least as many usable primes per bit-size as the circuit needs. Primes are
+	// consumed in slice order (Q stages first, then P), so order the pool by the
+	// intended Q-then-P role assignment. nil => stock auto-generation.
+	StagePrimePool map[int][]uint64
 }
 
 type CircuitOrder int

@@ -11,6 +11,13 @@ type EvaluatorProvider interface {
 	DecomposeNTT(level, levelP, pCount int, c1 ring.Poly, isNTT bool, BuffDecompQP []ringqp.Poly)
 	CheckAndGetGaloisKey(galEl uint64) (evk *GaloisKey, err error)
 	GadgetProductLazy(levelQ int, cx ring.Poly, gadgetCt *GadgetCiphertext, ct *Element[ringqp.Poly]) (err error)
+	// GadgetProductMultiPTraced is the vFHE-instrumented multi-special-prime
+	// key-switch (grouped RNS decomposition); exposed here so the lintrans
+	// giant-step can capture its key-switch in the multi-P rotation format.
+	GadgetProductMultiPTraced(levelQ int, cx ring.Poly, gadgetCt *GadgetCiphertext, ct *Ciphertext, sink ring.TraceSink) error
+	// ModDownQPtoQNTTMultiPTraced is the vFHE-instrumented multi-P ÷P mod-down,
+	// for tracing the lintrans BSGS inner-sum / accumulate ÷P reductions.
+	ModDownQPtoQNTTMultiPTraced(comp, levelQ, levelP int, p1Q, p1P, p2Q ring.Poly, L, nP int, sink ring.TraceSink)
 	GadgetProductHoistedLazy(levelQ int, BuffQPDecompQP []ringqp.Poly, gadgetCt *GadgetCiphertext, ct *Element[ringqp.Poly]) (err error)
 	AutomorphismHoistedLazy(levelQ int, ctIn *Ciphertext, c1DecompQP []ringqp.Poly, galEl uint64, ctQP *Element[ringqp.Poly]) (err error)
 	ModDownQPtoQNTT(levelQ, levelP int, p1Q, p1P, p2Q ring.Poly)

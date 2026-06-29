@@ -145,6 +145,14 @@ type Evaluator struct {
 	LTEvaluator *ltcommon.Evaluator
 	parameters  ckks.Parameters
 	pool        *rlwe.BufferPool
+
+	// vFHE trace capture (set by the bootstrapping evaluator during CoeffsToSlots
+	// / SlotsToCoeffs): when non-nil, dft() emits each matrix step's operand and
+	// result ciphertexts. TraceStep is the running matrix-step counter;
+	// TracePrefix names the region ("c2s" or "s2c") so the two DFTs stay distinct.
+	TraceSink   ring.TraceSink
+	TraceStep   int
+	TracePrefix string
 }
 
 // NewEvaluator instantiates a new [Evaluator] from a [ckks.Evaluator].
@@ -348,20 +356,54 @@ func (eval *Evaluator) dft(ctIn *rlwe.Ciphertext, mat Matrix, opOut *rlwe.Cipher
 
 	for _, lvl := range mat.Levels {
 		for range lvl {
+			in := opOut
 			if matrixIdx == 0 {
-				if err = eval.LTEvaluator.Evaluate(ctIn, mat.Matrices[matrixIdx], opOut); err != nil {
-					return
-				}
-			} else {
-				if err = eval.LTEvaluator.Evaluate(opOut, mat.Matrices[matrixIdx], opOut); err != nil {
-					return
-				}
+				in = ctIn
+			}
+
+			// vFHE: snapshot the operand before the (in-place) matrix multiply,
+			// and thread the trace sink into the lintrans evaluator so it captures
+			// this matrix step's BSGS inner sums (keyed by TraceStep).
+			var operand *rlwe.Ciphertext
+			if eval.TraceSink != nil {
+				operand = in.CopyNew()
+				eval.LTEvaluator.TraceSink = eval.TraceSink
+				eval.LTEvaluator.TraceStep = eval.TraceStep
+				eval.LTEvaluator.TracePrefix = eval.TracePrefix
+			}
+
+			if err = eval.LTEvaluator.Evaluate(in, mat.Matrices[matrixIdx], opOut); err != nil {
+				return
+			}
+			if eval.TraceSink != nil {
+				eval.LTEvaluator.TraceSink = nil // don't leak to other Evaluate calls
+			}
+
+			if eval.TraceSink != nil {
+				emitDFTStep(eval.TraceSink, eval.TracePrefix, eval.TraceStep, operand, opOut)
+				eval.TraceStep++
 			}
 
 			matrixIdx += 1
 
 		}
-		if err = eval.Rescale(opOut, opOut); err != nil {
+		// vFHE: capture the per-step rescale (drop a level between matrix levels)
+		// via the instrumented RescaleTraced when tracing + single-prime rescale;
+		// the runtime drains the "rs_*" regions on the trailing "rs_meta".
+		if eval.TraceSink != nil && eval.GetParameters().LevelsConsumedPerRescaling() == 1 && opOut.Level() >= 1 {
+			inLimbs := opOut.Level() + 1
+			if err = eval.RescaleTraced(opOut, opOut, dftPrefixSink{inner: eval.TraceSink, prefix: "rs_"}); err != nil {
+				return
+			}
+			// step = TraceStep-1 = the LAST matrix of this level (whose output this
+			// rescale consumes) — for the op-to-op edge to its ÷P producer.
+			pfxFlag := 0
+			if eval.TracePrefix == "s2c" {
+				pfxFlag = 1
+			}
+			eval.TraceSink.Poly("rs_meta", 0, []uint64{uint64(eval.GetParameters().N()), uint64(inLimbs),
+				uint64(eval.TraceStep - 1), uint64(pfxFlag)})
+		} else if err = eval.Rescale(opOut, opOut); err != nil {
 			return
 		}
 	}

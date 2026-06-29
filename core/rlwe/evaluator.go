@@ -233,3 +233,12 @@ func (eval Evaluator) AutomorphismIndex(galEl uint64) []uint64 {
 func (eval Evaluator) ModDownQPtoQNTT(levelQ, levelP int, p1Q, p1P, p2Q ring.Poly) {
 	eval.BasisExtender.ModDownQPtoQNTT(levelQ, levelP, p1Q, p1P, p2Q)
 }
+
+// ModDownQPtoQNTTMultiPTraced is the vFHE-instrumented multi-special-prime ÷P
+// mod-down (computes the same p2Q = ModDown(p1Q,p1P) but emits md_advice/
+// md_divround/md_ntt/ks so the standalone ÷P can be proven). Exposed on the
+// interface so the lintrans BSGS can trace the inner-sum and accumulate ÷P
+// reductions that bridge its QP-domain proofs to the Q-domain ones.
+func (eval Evaluator) ModDownQPtoQNTTMultiPTraced(comp, levelQ, levelP int, p1Q, p1P, p2Q ring.Poly, L, nP int, sink ring.TraceSink) {
+	eval.BasisExtender.ModDownQPtoQNTTMultiPTraced(comp, levelQ, levelP, p1Q, p1P, p2Q, L, nP, sink)
+}
