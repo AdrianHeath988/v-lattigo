@@ -38,3 +38,16 @@ type TraceSink interface {
 // < 2q); for q up to ~60 bits these stay well within uint64, so a plain modulo
 // is exact and cheap on the (cold) trace path.
 func reduceCanonical(v, q uint64) uint64 { return v % q }
+
+// Rescale ORIGIN TAGS, the last element of an "rs_meta".
+//
+// A bootstrap rescales at four different places and they were indistinguishable
+// once captured, so an operand that resolved to no producing proof named no stage
+// and the only way to find its producer was to guess. Here so every emitter and the
+// runtime read one definition.
+const (
+	RsOriginScaleDown   = 0 // ScaleDown's RescaleTo ladder
+	RsOriginDFTStep     = 1 // the per-level-group rescale inside CoeffsToSlots/SlotsToCoeffs
+	RsOriginDoubleAngle = 2 // EvalMod's double-angle rescale
+	RsOriginPolyEval    = 3 // the Chebyshev/Paterson-Stockmeyer evaluator's rescale
+)

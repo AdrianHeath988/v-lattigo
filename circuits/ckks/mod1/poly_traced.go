@@ -14,6 +14,10 @@ package mod1
 // the decorator delegates every method to the real evaluator and only adds tracing.
 
 import (
+	"fmt"
+	"os"
+
+	"github.com/tuneinsight/lattigo/v6/circuits/common/vfhetrace"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes"
@@ -26,6 +30,7 @@ const (
 	loMUL  = 1 // ct × ct (size-3 tensor)
 	loPADD = 2 // ct + scalar/plaintext
 	loMTA  = 3 // MulThenAdd: r = b + coeff·a
+	loSUB  = 4 // ct - ct (the Chebyshev power-basis recurrence)
 )
 
 // emitLinOp emits one linear op (ciphertexts a, b[, nil], r) under "lo_*" regions +
@@ -132,22 +137,141 @@ func (t *tracingPolyEvaluator) Add(op0 *rlwe.Ciphertext, op1 rlwe.Operand, opOut
 	return err
 }
 
-// Mul captures ct×ct (loMUL). op1 scalar (pure plaintext mul) is left to delegate only.
+// Sub captures ct-ct: the Chebyshev power-basis recurrence's subtraction,
+// T_{a+b} = 2*T_a*T_b - T_{a-b}.
+//
+// It was the one arithmetic method of the polynomial evaluator this decorator did
+// NOT override, so the power-basis element it produces had no board and no trace at
+// all -- and the rescale that follows it (power_basis.go: GenPower) then had an
+// operand no proof produced. Measured as the last two unbound hand-offs in the
+// bootstrap, and the reason they appeared in no other captured region: nothing
+// emitted the value.
+//
+// The board already existed (loSUB -> the SUB board); only the interception was
+// missing. In-place like Add, so op0 is snapshotted before delegating.
+func (t *tracingPolyEvaluator) Sub(op0 *rlwe.Ciphertext, op1 rlwe.Operand, opOut *rlwe.Ciphertext) error {
+	var before *rlwe.Ciphertext
+	if t.sink != nil {
+		before = op0.CopyNew()
+	}
+	// SCALE MATCHING. The SUB board proves r = a - b, and that is only what ckks.Sub
+	// computes when the operand scales already agree. When they differ it scales ONE
+	// side by an integer ratio first (evaluator.go, the `cmp` branches), so the real
+	// relation is r = k*a - b or r = a - k*b. Emitting a plain SUB there would prove
+	// a relation the engine never performed -- the capture self-check caught exactly
+	// that.
+	//
+	// One side scaled by a public integer, then a plain subtraction, is a PMUL
+	// followed by a SUB, and both boards already exist. The intermediate is a
+	// captured region on both halves (the PMUL's result and the SUB's operand), so
+	// the edge between them falls out of the ordinary fingerprint discovery.
+	op1ct := asCT(op1)
+	var beforeB *rlwe.Ciphertext
+	if t.sink != nil && op1ct != nil {
+		beforeB = op1ct.CopyNew()
+	}
+	err := t.Evaluator.Sub(op0, op1, opOut)
+	if err != nil || t.sink == nil {
+		return err
+	}
+	if op1ct == nil {
+		// A scalar subtraction would be a PADD by the negated constant; the power
+		// basis never does one, so it is deliberately not modelled here.
+		return nil
+	}
+	if opOut != op0 {
+		// ckks.Sub's scale matching differs by which operand aliases the output, and
+		// only the opOut==op0 form occurs in the power basis. Guessing at the others
+		// is how a board comes to prove the wrong relation.
+		fmt.Fprintf(os.Stderr, "[vfhe] WARNING Sub NOT captured (opOut is not op0, a "+
+			"form the capture does not model): its result will be bound to nothing\n")
+		return nil
+	}
+	switch before.Scale.Cmp(beforeB.Scale) {
+	case 0:
+		emitLinOp(t.sink, loSUB, before, beforeB, opOut, nil)
+	case 1: // a has the larger scale: b is scaled up to match
+		t.emitScaledSub(before, beforeB, opOut, before.Scale.Div(beforeB.Scale), false)
+	default: // b has the larger scale: a is scaled up
+		t.emitScaledSub(before, beforeB, opOut, beforeB.Scale.Div(before.Scale), true)
+	}
+	return nil
+}
+
+// emitScaledSub emits the two boards of a scale-matched subtraction: the integer
+// PMUL that brings one side to the other's scale, then the plain SUB.
+//
+// THE PLAINTEXT REFERENCE COMES FROM THE ENGINE, via MulRefPlain. ckks.Mul by a
+// *big.Int is NOT a raw modular scalar multiply: it converts the scalar to a
+// bignum.Complex, derives an RNS scalar pair through bigComplexToRNSScalar (which
+// rounds), and applies MulDoubleRNSScalar. A hand-rolled "ratio mod q_l broadcast"
+// -- which is the right model for ring.MulScalar, and is what ModUp's scalings
+// use -- is therefore the WRONG reference here, and the coefficient binding
+// rejected it. MulRefPlain instead multiplies the engine's own Mul over an
+// all-ones ciphertext, so the reference is the engine's semantics rather than a
+// model of them, while still being derived independently of the trace.
+//
+// A non-positive ratio means the engine did NOT scale (it guards on ratioInt > 0),
+// so the plain relation still holds and one board is enough.
+func (t *tracingPolyEvaluator) emitScaledSub(a, b, r *rlwe.Ciphertext,
+	ratio rlwe.Scale, scaleA bool) {
+	ratioInt, _ := ratio.Value.Int(nil)
+	if ratioInt == nil || ratioInt.Sign() <= 0 {
+		emitLinOp(t.sink, loSUB, a, b, r, nil)
+		return
+	}
+	params := t.ckksEval.GetParameters()
+	src := b
+	if scaleA {
+		src = a
+	}
+	scaled := ckks.NewCiphertext(*params, src.Degree(), r.Level())
+	// COPY the metadata, do not alias it: Mul writes opOut.Scale from op0.Scale, so
+	// a shared pointer changes the operand's scale underneath the operation.
+	*scaled.MetaData = *src.MetaData
+	if err := t.ckksEval.Mul(src, ratioInt, scaled); err != nil {
+		fmt.Fprintf(os.Stderr, "[vfhe] WARNING scale-matched Sub NOT captured "+
+			"(%v): its result will be bound to nothing\n", err)
+		return
+	}
+	ref := vfhetrace.MulRefPlain(t.ckksEval, r.Level(), rlwe.NewScale(1), ratioInt)
+	vfhetrace.EmitLinOp(t.sink, vfhetrace.OpPMUL, src, nil, scaled, ref)
+	if scaleA {
+		emitLinOp(t.sink, loSUB, scaled, b, r, nil)
+	} else {
+		emitLinOp(t.sink, loSUB, a, scaled, r, nil)
+	}
+}
+
+// Mul captures both forms: ct×ct is the tensor product (loMUL), ct×scalar is a
+// multiply by a PUBLIC coefficient (loPMUL). The scalar form used to delegate
+// without capture, which left an arithmetic step of the polynomial evaluation
+// with no board — and, being a coefficient application, one where substituting a
+// different constant changes what EvalMod computes.
 func (t *tracingPolyEvaluator) Mul(op0 *rlwe.Ciphertext, op1 rlwe.Operand, opOut *rlwe.Ciphertext) error {
 	var before *rlwe.Ciphertext
 	op1ct := asCT(op1)
-	if t.sink != nil && op1ct != nil {
+	if t.sink != nil {
 		before = op0.CopyNew()
 	}
 	err := t.Evaluator.Mul(op0, op1, opOut)
-	if err == nil && t.sink != nil && op1ct != nil {
+	if err != nil || t.sink == nil || before == nil {
+		return err
+	}
+	if op1ct != nil {
 		b := op1ct
 		if op1ct == op0 {
 			b = before
 		}
 		emitLinOp(t.sink, loMUL, before, b, opOut, nil)
+		return nil
 	}
-	return err
+	// Scalar: bind the plaintext to the public coefficient, encoded at the scale
+	// the multiply consumes (opOut.Scale / op0.Scale), exactly as MulThenAdd does.
+	ref := vfhetrace.MulRefPlain(t.ckksEval, opOut.Level(),
+		opOut.Scale.Div(before.Scale), op1)
+	vfhetrace.EmitLinOp(t.sink, vfhetrace.OpPMUL, before, nil, opOut, ref)
+	return nil
 }
 
 // MulNew captures the (degree-2, unrelinearized) ct×ct product from the power basis.
@@ -210,7 +334,8 @@ func (t *tracingPolyEvaluator) Rescale(op0, op1 *rlwe.Ciphertext) error {
 		inLimbs := op0.Level() + 1
 		if err := t.ckksEval.RescaleTraced(cp, tmp,
 			mod1PrefixSink{inner: t.sink, prefix: "rs_"}); err == nil {
-			t.sink.Poly("rs_meta", 0, []uint64{uint64(t.ckksEval.GetParameters().N()), uint64(inLimbs)})
+			t.sink.Poly("rs_meta", 0, []uint64{uint64(t.ckksEval.GetParameters().N()),
+				uint64(inLimbs), 0, 0, ring.RsOriginPolyEval})
 		}
 	}
 	return t.Evaluator.Rescale(op0, op1)

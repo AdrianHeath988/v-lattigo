@@ -5,10 +5,12 @@ import (
 	"math"
 	"math/big"
 	"math/bits"
+	"os"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/dft"
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/mod1"
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/polynomial"
+	"github.com/tuneinsight/lattigo/v6/circuits/common/vfhetrace"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
@@ -339,8 +341,21 @@ func (eval Evaluator) Evaluate(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, e
 		diffScale = diffScale.Div(*errScale)
 
 		// [M^{d} + e^{d-logprec}]
+		// vFHE: the post-bootstrap scale correction. It runs OUTSIDE bootstrap(),
+		// after every stage proof is done, so untraced it was a multiply by an
+		// arbitrary constant applied to the finished result -- the last thing the
+		// bootstrap does and the easiest place to change the answer.
+		var scBefore *rlwe.Ciphertext
+		if eval.TraceSink != nil {
+			scBefore = ctOut.CopyNew()
+		}
 		if err = eval.Evaluator.Mul(ctOut, diffScale.BigInt(), ctOut); err != nil {
 			return nil, err
+		}
+		if scBefore != nil {
+			vfhetrace.EmitLinOp(eval.TraceSink, vfhetrace.OpPMUL, scBefore, nil, ctOut,
+				vfhetrace.MulRefPlain(eval.Evaluator, ctOut.Level(),
+					rlwe.NewScale(1), diffScale.BigInt()))
 		}
 		ctOut.Scale = ctIn.Scale
 
@@ -575,8 +590,24 @@ func (eval Evaluator) ScaleDown(ctIn *rlwe.Ciphertext) (*rlwe.Ciphertext, *rlwe.
 	r := params.RingQ()
 
 	// Removes unecessary primes
+	//
+	// vFHE: each Resize is a limb TRUNCATION -- the surviving limbs are untouched,
+	// which is exactly what the modswitch board proves. Untraced it was still a
+	// level change nothing accounted for, so the chain from the bootstrap input
+	// into ScaleDown's scale-up had an unexplained discontinuity. Emitted per
+	// dropped prime, at the SURVIVING limb count (the board binds only those).
 	for ctIn.Level() != 0 && checkMessageRatio(ctIn, eval.Mod1Parameters.MessageRatio(), r) {
+		var msOperand []ring.Poly
+		if eval.TraceSink != nil {
+			msOperand = make([]ring.Poly, len(ctIn.Value))
+			for k := range ctIn.Value {
+				msOperand[k] = *ctIn.Value[k].CopyNew()
+			}
+		}
 		ctIn.Resize(ctIn.Degree(), ctIn.Level()-1)
+		if eval.TraceSink != nil {
+			emitModswitch(eval.TraceSink, r.N(), ctIn.Level()+1, msOperand, ctIn.Value)
+		}
 	}
 
 	// Current Message Ratio
@@ -644,7 +675,13 @@ func (eval Evaluator) ScaleDown(ctIn *rlwe.Ciphertext) (*rlwe.Ciphertext, *rlwe.
 	targetScale.Quo(targetScale, new(big.Float).SetFloat64(eval.Mod1Parameters.MessageRatio()))
 
 	if ctIn.Level() != 0 {
-		if err := eval.RescaleTo(ctIn, rlwe.NewScale(targetScale), ctIn); err != nil {
+		// vFHE: route through the traced form, which performs the same reduction as
+		// n SINGLE-level rescales so each dropped prime gets a board. RescaleTo does
+		// all n in one pass and never materialises the intermediates, leaving
+		// nothing for the per-level board to bind. Falls back to RescaleTo verbatim
+		// when there is no sink.
+		if err := eval.RescaleToTraced(ctIn, rlwe.NewScale(targetScale), ctIn,
+			eval.TraceSink); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -660,7 +697,8 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 
 	// Switch to the sparse key
 	if eval.EvkDenseToSparse != nil {
-		if err := eval.ApplyEvaluationKey(ctIn, eval.EvkDenseToSparse, ctIn); err != nil {
+		// vFHE: the dense->sparse switch that opens ModUp, captured.
+		if err := eval.applyEvkTraced(ctIn, eval.EvkDenseToSparse); err != nil {
 			return nil, err
 		}
 	}
@@ -670,8 +708,24 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 	ringQ := params.RingQ().AtLevel(ctIn.Level())
 	ringP := params.RingP()
 
+	// vFHE: the domain conversion at the head of ModUp. This is the last piece of
+	// the ScaleDown -> ModUp seam, and not a formality: it PRODUCES the value the
+	// centered lift then binds, so while it was untraced the lift committed to an
+	// integer with no proven connection to the ciphertext that entered the
+	// bootstrap. The board is gen_board_intt (standalone GS_INTT). In place, so the
+	// eval-domain side is snapshotted first.
+	var inttIn []ring.Poly
+	if eval.TraceSink != nil {
+		inttIn = make([]ring.Poly, len(ctIn.Value))
+		for i := range ctIn.Value {
+			inttIn[i] = *ctIn.Value[i].CopyNew()
+		}
+	}
 	for i := range ctIn.Value {
 		ringQ.INTT(ctIn.Value[i], ctIn.Value[i])
+	}
+	if eval.TraceSink != nil {
+		emitIntt(eval.TraceSink, ringQ.N(), ctIn.Level()+1, inttIn, ctIn.Value)
 	}
 
 	// Extend the ciphertext from q to Q with zero values.
@@ -786,7 +840,21 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 				ringP.MulScalar(buffDecompQP[0].P, scalar, buffDecompQP[i].P)
 			}
 
+			// vFHE: the message-ratio scaling. A pointwise multiply by a PUBLIC
+			// integer, so it lands on the plainop board with the scalar broadcast
+			// as its plaintext -- the same shape ScaleDown's scale-up already uses.
+			// Snapshot first: the multiply is in place.
+			var msBefore ring.Poly
+			if eval.TraceSink != nil {
+				msBefore = ringQ.NewPoly()
+				msBefore.CopyLvl(levelQ, ctIn.Value[0])
+			}
 			ringQ.MulScalar(ctIn.Value[0], scalar, ctIn.Value[0])
+			if eval.TraceSink != nil {
+				vfhetrace.EmitPolyOp(eval.TraceSink, vfhetrace.OpPMUL, levelQ+1,
+					[]ring.Poly{msBefore}, nil, []ring.Poly{ctIn.Value[0]},
+					vfhetrace.ScalarBroadcastRef(scalar, Q, levelQ+1, N))
+			}
 
 			ctIn.Scale = ctIn.Scale.Mul(rlwe.NewScale(scale))
 		}
@@ -798,9 +866,59 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 		ctTmp.Value = []ring.Poly{*buffQ1, ctIn.Value[1]}
 		ctTmp.MetaData = ctIn.MetaData
 
-		// Switch back to the dense key
-		ks.GadgetProductHoisted(levelQ, buffDecompQP, &eval.EvkSparseToDense.GadgetCiphertext, ctTmp)
+		// Switch back to the dense key.
+		//
+		// vFHE: routed through the traced form when capturing, so this key-switch
+		// lands on the same multi-P board every other one does. It is the last
+		// unproved operation ModUp performs on the value it hands to CoeffsToSlots.
+		// The traced form performs the identical MAC and mod-down, so production
+		// gets the same result; without a sink it is not called at all.
+		if eval.TraceSink != nil {
+			hoistSink := btpPrefixSink{inner: eval.TraceSink, prefix: "ks_"}
+			// c_in and result are the CALLER's to emit: the traced gadget product
+			// proves prod -> mod-down, and what the caller does with the result is
+			// what decides the board's outer relation. Here nothing is added to the
+			// product and nothing is permuted, so c_in is zero and the automorphism
+			// index is the identity (which assembleKSBuffer supplies when absent).
+			zero := make([]uint64, ringQ.N())
+			for k := 0; k < 2; k++ {
+				for l := 0; l <= levelQ; l++ {
+					hoistSink.Poly("c_in", k*(levelQ+1)+l, zero)
+				}
+			}
+			if err := ks.GadgetProductHoistedMultiPTraced(levelQ, buffDecompQP,
+				&eval.EvkSparseToDense.GadgetCiphertext, ctTmp, hoistSink); err != nil {
+				// Capture must never change the result: fall back to the production
+				// path rather than leaving ctTmp half-written.
+				ks.GadgetProductHoisted(levelQ, buffDecompQP, &eval.EvkSparseToDense.GadgetCiphertext, ctTmp)
+			} else {
+				for k := 0; k < 2; k++ {
+					for l := 0; l <= levelQ; l++ {
+						hoistSink.Poly("result", k*(levelQ+1)+l,
+							append([]uint64{}, ctTmp.Value[k].Coeffs[l]...))
+					}
+				}
+				d := eval.BootstrappingParameters.Parameters.BaseRNSDecompositionVectorSize(levelQ, levelP)
+				eval.TraceSink.Poly("ks_meta", 0, []uint64{
+					uint64(ringQ.N()), uint64(levelQ + 1), uint64(levelP + 1), uint64(d)})
+			}
+		} else {
+			ks.GadgetProductHoisted(levelQ, buffDecompQP, &eval.EvkSparseToDense.GadgetCiphertext, ctTmp)
+		}
+		// vFHE: folding the sparse->dense key-switch output back in. An ordinary
+		// add on bare polys; the key-switch that produced ctTmp is the hoisted
+		// gadget product, which still needs its own traced primitive.
+		var addBefore ring.Poly
+		if eval.TraceSink != nil {
+			addBefore = ringQ.NewPoly()
+			addBefore.CopyLvl(levelQ, ctIn.Value[0])
+		}
 		ringQ.Add(ctIn.Value[0], ctTmp.Value[0], ctIn.Value[0])
+		if eval.TraceSink != nil {
+			vfhetrace.EmitPolyOp(eval.TraceSink, vfhetrace.OpADD, levelQ+1,
+				[]ring.Poly{addBefore}, []ring.Poly{ctTmp.Value[0]},
+				[]ring.Poly{ctIn.Value[0]}, nil)
+		}
 
 	} else {
 
@@ -827,15 +945,29 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 
 			scalar := uint64(math.Round(scale))
 
+			// vFHE: same message-ratio scaling on the dense path, both components.
+			var dBefore []ring.Poly
+			if eval.TraceSink != nil {
+				dBefore = []ring.Poly{ringQ.NewPoly(), ringQ.NewPoly()}
+				dBefore[0].CopyLvl(levelQ, ctIn.Value[0])
+				dBefore[1].CopyLvl(levelQ, ctIn.Value[1])
+			}
 			ringQ.MulScalar(ctIn.Value[0], scalar, ctIn.Value[0])
 			ringQ.MulScalar(ctIn.Value[1], scalar, ctIn.Value[1])
+			if eval.TraceSink != nil {
+				vfhetrace.EmitPolyOp(eval.TraceSink, vfhetrace.OpPMUL, levelQ+1,
+					dBefore, nil, []ring.Poly{ctIn.Value[0], ctIn.Value[1]},
+					vfhetrace.ScalarBroadcastRef(scalar, Q, levelQ+1, N))
+			}
 
 			ctIn.Scale = ctIn.Scale.Mul(rlwe.NewScale(scale))
 		}
 	}
 
 	//SubSum X -> (N/dslots) * Y^dslots
-	return ctIn, eval.Trace(ctIn, eval.CoeffsToSlotsParameters.LogSlots, ctIn)
+	// vFHE: the ladder is mirrored under instrumentation when capturing; falls
+	// back to rlwe.Trace verbatim otherwise.
+	return ctIn, eval.traceTraced(ctIn, eval.CoeffsToSlotsParameters.LogSlots)
 }
 
 // CoeffsToSlots applies the homomorphic decoding
@@ -1134,4 +1266,280 @@ func (eval Evaluator) pack(cts []rlwe.Ciphertext, ctxt packingContext, xPow2 []r
 	}
 
 	return cts, nil
+}
+
+// emitModswitch captures one limb truncation under "ms_*" regions plus the
+// "ms_meta" trigger the runtime drains. `limbs` is the SURVIVING count: the
+// modswitch board binds the limbs that remain, and the dropped ones have no
+// consumer and nothing provable about them.
+func emitModswitch(sink ring.TraceSink, N, limbs int, operand, result []ring.Poly) {
+	if sink == nil || limbs <= 0 || len(operand) == 0 {
+		return
+	}
+	put := func(region string, polys []ring.Poly) {
+		for p := 0; p < len(polys); p++ {
+			for l := 0; l < limbs && l < len(polys[p].Coeffs); l++ {
+				sink.Poly(region, p*limbs+l, append([]uint64{}, polys[p].Coeffs[l]...))
+			}
+		}
+	}
+	put("ms_operand", operand)
+	put("ms_result", result)
+	sink.Poly("ms_meta", 0, []uint64{uint64(N), uint64(limbs), uint64(len(result))})
+}
+
+// emitIntt captures the eval -> coefficient conversion under "intt_*" regions plus
+// the "intt_meta" trigger the runtime drains. `limbs` is the ciphertext's limb
+// count; both sides are emitted at it, since the board binds them pairwise.
+func emitIntt(sink ring.TraceSink, N, limbs int, operand, result []ring.Poly) {
+	if sink == nil || limbs <= 0 || len(operand) == 0 {
+		return
+	}
+	put := func(region string, polys []ring.Poly) {
+		for p := 0; p < len(polys); p++ {
+			for l := 0; l < limbs && l < len(polys[p].Coeffs); l++ {
+				sink.Poly(region, p*limbs+l, append([]uint64{}, polys[p].Coeffs[l]...))
+			}
+		}
+	}
+	put("intt_operand", operand)
+	put("intt_result", result)
+	sink.Poly("intt_meta", 0, []uint64{uint64(N), uint64(limbs), uint64(len(result))})
+}
+
+// btpPrefixSink wraps a TraceSink with a region prefix, so a captured key-switch
+// lands under the "ks_*" keys the runtime's flushKS drains rather than colliding
+// with the bootstrap's own regions. Mirrors the equivalent wrappers in the dft and
+// mod1 packages.
+type btpPrefixSink struct {
+	inner  ring.TraceSink
+	prefix string
+}
+
+func (p btpPrefixSink) Poly(region string, idx int, vals []uint64) {
+	p.inner.Poly(p.prefix+region, idx, vals)
+}
+func (p btpPrefixSink) Stage(region string, idx, stage int, vals []uint64) {
+	p.inner.Stage(p.prefix+region, idx, stage, vals)
+}
+
+// ksMetaFor closes a captured key-switch with the "ks_meta" trigger the runtime
+// drains on. The traced automorphism emits the whole board; only the shape the
+// assembler needs is the caller's.
+func (eval Evaluator) ksMetaFor(level int, galEl uint64) {
+	params := eval.BootstrappingParameters
+	levelP := params.MaxLevelP()
+	eval.TraceSink.Poly("ks_meta", 0, []uint64{
+		uint64(params.N()), uint64(level + 1), uint64(levelP + 1),
+		uint64(params.BaseRNSDecompositionVectorSize(level, levelP)), galEl})
+}
+
+// applyEvkTraced is ApplyEvaluationKey with the key-switch captured.
+//
+// ModUp opens by switching to the sparse secret, and closes by switching back.
+// The closing one now goes through the traced hoisted gadget product; this is the
+// opening one, which is an ordinary (non-hoisted) key-switch of c1 followed by
+// result = (c0 + ks0, ks1) -- no permutation, so the identity index applies.
+//
+// BEST-EFFORT: any failure falls back to the production call, so a capture
+// problem can never change the ciphertext.
+func (eval Evaluator) applyEvkTraced(ct *rlwe.Ciphertext, evk *rlwe.EvaluationKey) error {
+	params := eval.BootstrappingParameters
+	levelP := params.MaxLevelP()
+	if eval.TraceSink == nil || levelP < 1 || ct.Degree() != 1 {
+		// Untraced on purpose when there is no sink. WITH a sink it means this
+		// key-switch runs with no board and no trace at all -- see the note on the
+		// other fallback below.
+		if eval.TraceSink != nil {
+			fmt.Fprintf(os.Stderr, "[vfhe] WARNING ModUp key-switch NOT captured "+
+				"(levelP=%d degree=%d): it will change the ciphertext with no board "+
+				"and no trace, so the value it produces is bound to nothing\n",
+				levelP, ct.Degree())
+		}
+		return eval.ApplyEvaluationKey(ct, evk, ct)
+	}
+	level := ct.Level()
+	ringQ := params.RingQ().AtLevel(level)
+	N, L := ringQ.N(), level+1
+	sink := btpPrefixSink{inner: eval.TraceSink, prefix: "ks_"}
+
+	zero := make([]uint64, N)
+	for l := 0; l < L; l++ {
+		sink.Poly("c_in", 0*L+l, append([]uint64{}, ct.Value[0].Coeffs[l]...))
+		sink.Poly("c_in", 1*L+l, zero)
+	}
+	ksCt := ckks.NewCiphertext(params, 1, level)
+	ksCt.MetaData = ct.MetaData
+	// SINGLE SPECIAL PRIME. The dense->sparse encapsulation key is generated at one
+	// Q prime and one P prime (keys.go: paramsSparse takes Q[:1], P[:1]), so
+	// evk.LevelP() == 0 and the MULTI-P traced product rejects it -- which used to
+	// mean this key-switch silently fell back to the untraced production call. It
+	// then changed the ciphertext with no board and no trace, and ModUp's INTT
+	// operand became a value nothing produced.
+	//
+	// It needs no new gadget: one special prime IS the shape GadgetProductTraced and
+	// vfhe::layout_relin already model (the same board the circuit's own relins use).
+	// Emitted under its own "ks1_" prefix so the runtime assembles layout_relin
+	// rather than layout_relin_multip, with the identity output permutation -- an
+	// ApplyEvaluationKey does not permute.
+	if evk.LevelP() == 0 {
+		return eval.applyEvkSingleP(ct, evk, level)
+	}
+	if err := eval.GadgetProductMultiPTraced(level, ct.Value[1],
+		&evk.GadgetCiphertext, ksCt, sink); err != nil {
+		// A SILENT fallback here is the worst kind of gap: the ciphertext changes,
+		// nothing is emitted, and the next op's operand is a value no proof produced
+		// -- which is exactly how ModUp's INTT operand came to "appear nowhere else"
+		// in the region index. The capture failing must never be quieter than the
+		// capture succeeding.
+		fmt.Fprintf(os.Stderr, "[vfhe] WARNING ModUp key-switch capture FAILED (%v); "+
+			"falling back to the untraced call -- the value it produces will be bound "+
+			"to nothing\n", err)
+		return eval.ApplyEvaluationKey(ct, evk, ct)
+	}
+	ringQ.Add(ksCt.Value[0], ct.Value[0], ksCt.Value[0])
+	ct.Value[0].CopyLvl(level, ksCt.Value[0])
+	ct.Value[1].CopyLvl(level, ksCt.Value[1])
+	for k := 0; k < 2; k++ {
+		for l := 0; l < L; l++ {
+			sink.Poly("result", k*L+l, append([]uint64{}, ct.Value[k].Coeffs[l]...))
+		}
+	}
+	eval.ksMetaFor(level, 0) // no permutation: identity index
+	return nil
+}
+
+// applyEvkSingleP is applyEvkTraced's single-special-prime path: the same
+// key-switch, captured in the layout_relin shape.
+//
+// Region contract mirrors ckks.AutomorphismTraced, which is the same operation
+// with a permutation on the end: target = c1, c_in = (c0, 0), then the gadget
+// product (evk / mod-up / MAC / mod-down), then result = (c0 + ks0, ks1). No
+// automorphism here, so the runtime binds the identity index.
+//
+// levelQ is clamped to the KEY's Q level: the encapsulation key lives at one prime,
+// so the switch happens there whatever level the ciphertext arrived at.
+func (eval Evaluator) applyEvkSingleP(ct *rlwe.Ciphertext, evk *rlwe.EvaluationKey,
+	ctLevel int) error {
+	params := eval.BootstrappingParameters
+	levelQ := ctLevel
+	if kq := evk.LevelQ(); kq < levelQ {
+		levelQ = kq
+	}
+	if levelQ < 0 {
+		return eval.ApplyEvaluationKey(ct, evk, ct)
+	}
+	ringQ := params.RingQ().AtLevel(levelQ)
+	N, L := ringQ.N(), levelQ+1
+	sink := btpPrefixSink{inner: eval.TraceSink, prefix: "ks1_"}
+
+	zero := make([]uint64, N)
+	for l := 0; l < L; l++ {
+		sink.Poly("target", l, append([]uint64{}, ct.Value[1].Coeffs[l]...))
+		sink.Poly("c_in", 0*L+l, append([]uint64{}, ct.Value[0].Coeffs[l]...))
+		sink.Poly("c_in", 1*L+l, zero)
+	}
+
+	ksCt := ckks.NewCiphertext(params, 1, levelQ)
+	ksCt.MetaData = ct.MetaData
+	if err := eval.GadgetProductTraced(levelQ, ct.Value[1],
+		&evk.GadgetCiphertext, ksCt, sink); err != nil {
+		fmt.Fprintf(os.Stderr, "[vfhe] WARNING single-P ModUp key-switch capture "+
+			"FAILED (%v); falling back to the untraced call -- the value it produces "+
+			"will be bound to nothing\n", err)
+		return eval.ApplyEvaluationKey(ct, evk, ct)
+	}
+	ringQ.Add(ksCt.Value[0], ct.Value[0], ksCt.Value[0])
+	ct.Value[0].CopyLvl(levelQ, ksCt.Value[0])
+	ct.Value[1].CopyLvl(levelQ, ksCt.Value[1])
+	ct.Resize(ct.Degree(), levelQ)
+
+	for k := 0; k < 2; k++ {
+		for l := 0; l < L; l++ {
+			sink.Poly("result", k*L+l, append([]uint64{}, ct.Value[k].Coeffs[l]...))
+		}
+	}
+	// meta LAST: it is the runtime's flush trigger, so every region above must
+	// already be present when it lands.
+	eval.TraceSink.Poly("ks1_meta", 0, []uint64{uint64(N), uint64(L)})
+	return nil
+}
+
+// traceTraced is rlwe.Trace with every operation captured.
+//
+// The Trace (SubSum) that closes ModUp is a LADDER -- a scalar pre-multiply, then
+// one automorphism and one add per halving of the slot count -- and it is the last
+// thing ModUp does to the value CoeffsToSlots then consumes. rlwe.Trace cannot be
+// instrumented in place because the traced automorphism lives in the ckks package,
+// which rlwe cannot import, so the ladder is mirrored here and each step routed
+// through the traced primitives.
+//
+// Anything outside the bootstrap's own configuration (non-NTT input, conjugate
+// invariant ring, no special prime) falls back to rlwe.Trace unchanged.
+func (eval Evaluator) traceTraced(ct *rlwe.Ciphertext, logN int) error {
+	params := eval.BootstrappingParameters
+	levelP := params.MaxLevelP()
+	if eval.TraceSink == nil || levelP < 1 || !ct.IsNTT ||
+		params.RingType() != ring.Standard {
+		return eval.Trace(ct, logN, ct)
+	}
+	level := ct.Level()
+	ringQ := params.RingQ().AtLevel(level)
+
+	gap := 1 << (params.LogN() - logN - 1)
+	if logN == 0 {
+		gap <<= 1
+	}
+	if gap <= 1 {
+		return nil // Trace is the identity here
+	}
+
+	// Pre-multiplication by (N/n)^-1: a multiply by a PUBLIC integer, so it lands
+	// on the plainop board with that constant reduced into each limb.
+	NInv := new(big.Int).SetUint64(uint64(gap))
+	NInv.ModInverse(NInv, ringQ.ModulusAtLevel[level])
+	before := []ring.Poly{*ct.Value[0].CopyNew(), *ct.Value[1].CopyNew()}
+	ringQ.MulScalarBigint(ct.Value[0], NInv, ct.Value[0])
+	ringQ.MulScalarBigint(ct.Value[1], NInv, ct.Value[1])
+	ref := make([][]uint64, level+1)
+	for l := 0; l <= level; l++ {
+		q := new(big.Int).SetUint64(ringQ.SubRings[l].Modulus)
+		v := new(big.Int).Mod(NInv, q).Uint64()
+		row := make([]uint64, ringQ.N())
+		for x := range row {
+			row[x] = v
+		}
+		ref[l] = row
+	}
+	vfhetrace.EmitPolyOp(eval.TraceSink, vfhetrace.OpPMUL, level+1, before, nil,
+		[]ring.Poly{ct.Value[0], ct.Value[1]}, ref)
+
+	// The ladder: automorphism, then accumulate.
+	step := func(galEl uint64) error {
+		buff := ckks.NewCiphertext(params, 1, level)
+		buff.MetaData = ct.MetaData
+		sink := btpPrefixSink{inner: eval.TraceSink, prefix: "ks_"}
+		if err := eval.AutomorphismMultiPTraced(ct, galEl, buff, sink); err != nil {
+			return err
+		}
+		eval.ksMetaFor(level, galEl)
+		acc := []ring.Poly{*ct.Value[0].CopyNew(), *ct.Value[1].CopyNew()}
+		ringQ.Add(ct.Value[0], buff.Value[0], ct.Value[0])
+		ringQ.Add(ct.Value[1], buff.Value[1], ct.Value[1])
+		vfhetrace.EmitPolyOp(eval.TraceSink, vfhetrace.OpADD, level+1, acc,
+			[]ring.Poly{buff.Value[0], buff.Value[1]},
+			[]ring.Poly{ct.Value[0], ct.Value[1]}, nil)
+		return nil
+	}
+	for i := logN; i < params.LogN()-1; i++ {
+		if err := step(params.GaloisElement(1 << i)); err != nil {
+			return err
+		}
+	}
+	if logN == 0 {
+		if err := step(ringQ.NthRoot() - 1); err != nil {
+			return err
+		}
+	}
+	return nil
 }

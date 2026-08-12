@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/tuneinsight/lattigo/v6/circuits/common/vfhetrace"
+
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/ring/ringqp"
@@ -119,6 +121,22 @@ func (eval Evaluator) captureBabyResult(res *rlwe.Element[ringqp.Poly], levelQ, 
 	for k := 0; k < 2; k++ {
 		for l := 0; l <= levelQ; l++ {
 			bm.Poly("result", (bk*2+k)*64+l, append([]uint64{}, res.Value[k].Q.Coeffs[l]...))
+		}
+	}
+	// The P HALF, under its own region.
+	//
+	// A hoisted baby rotation is a QP-basis value and the BSGS inner sum consumes
+	// BOTH halves -- lt*_in over the Q primes and lt*_inP over the P primes. Only
+	// the Q half was captured, so every P-basis operand had no producing proof to
+	// bind to: 1146 of them, measured, versus 0 that were genuinely external. The
+	// value is right here in res.Value[k].P; nothing needs recomputing, and the
+	// same "no re-invocation" rule applies (this is a read of the finished result,
+	// not a second GadgetProductHoistedLazy).
+	if res.Value[0].P.Level() >= 0 {
+		for k := 0; k < 2; k++ {
+			for l := 0; l <= res.Value[k].P.Level(); l++ {
+				bm.Poly("resultP", (bk*2+k)*64+l, append([]uint64{}, res.Value[k].P.Coeffs[l]...))
+			}
 		}
 	}
 }
@@ -484,8 +502,34 @@ func (eval Evaluator) MultiplyByDiagMatrixBSGS(ctIn *rlwe.Ciphertext, matrix Lin
 	c0OutQP := ringqp.Poly{Q: opOut.Value[0], P: *buffP1}
 	c1OutQP := ringqp.Poly{Q: opOut.Value[1], P: *buffP2}
 
+	// vFHE: the P-SCALING OF THE STEP INPUT, captured as the plaintext multiply it
+	// is. Snapshot before the in-place scale; emit after.
+	//
+	// WHY IT NEEDS A BOARD. This is the operand the i==0 diagonal of every inner sum
+	// consumes: for i != 0 the operand is ctPreRot[i], published by that baby
+	// rotation's BABYC board, but rotation by zero is the identity so ctPreRot[0] is
+	// never created and no board published P*c. Every matrix step's diagonal-0
+	// operand therefore resolved to no producing proof -- measured 7 (4 in
+	// CoeffsToSlots, 3 in SlotsToCoeffs, one per matrix step) -- leaving the inner
+	// sum free to claim any value there. Exactly the coverage gap BABYC was added to
+	// close, in the one case BABYC structurally cannot reach.
+	//
+	// It needs no new gadget: r = P*c per limb per component is a scalar multiply,
+	// which the existing plainop board proves, and P is public (the special-prime
+	// product), so ScalarBigintBroadcastRef gives the independent reference the
+	// coefficient binding compares against.
+	var preScale []ring.Poly
+	if eval.TraceSink != nil {
+		preScale = []ring.Poly{*ctInTmp0.CopyNew(), *ctInTmp1.CopyNew()}
+	}
 	ringQ.MulScalarBigint(ctInTmp0, ringP.ModulusAtLevel[levelP], ctInTmp0) // P*c0
 	ringQ.MulScalarBigint(ctInTmp1, ringP.ModulusAtLevel[levelP], ctInTmp1) // P*c1
+	if eval.TraceSink != nil {
+		vfhetrace.EmitPolyOp(eval.TraceSink, vfhetrace.OpPMUL, levelQ+1,
+			preScale, nil, []ring.Poly{ctInTmp0, ctInTmp1},
+			vfhetrace.ScalarBigintBroadcastRef(ringP.ModulusAtLevel[levelP],
+				ringQ.ModuliChain(), levelQ+1, ringQ.N()))
+	}
 
 	keys := utils.GetSortedKeys(index)
 

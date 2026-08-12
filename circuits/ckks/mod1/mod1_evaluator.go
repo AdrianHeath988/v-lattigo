@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"math/cmplx"
+	"os"
 
 	"github.com/tuneinsight/lattigo/v6/circuits/ckks/polynomial"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
@@ -182,6 +183,19 @@ func (eval Evaluator) EvaluateAndScaleNew(ct *rlwe.Ciphertext, scaling complex12
 		// and relinearize it through the instrumented multi-P path into a throwaway
 		// ciphertext; the runtime drains the "rl_*" regions on the trailing "rl_meta".
 		// Recompute (not split) keeps the numerically-sensitive bootstrap path exact.
+		// A SKIPPED capture here leaves the double-angle relin with no board and its
+		// result bound to nothing -- the same silent gap the ModUp key-switch had.
+		if eval.TraceSink != nil &&
+			!(len(eval.GetParameters().P()) >= 2 && dIn != nil && dIn.Level() >= 1) {
+			fmt.Fprintf(os.Stderr, "[vfhe] WARNING double-angle relin NOT captured "+
+				"(nP=%d level=%d): its result will be bound to nothing\n",
+				len(eval.GetParameters().P()), func() int {
+					if dIn == nil {
+						return -1
+					}
+					return dIn.Level()
+				}())
+		}
 		if eval.TraceSink != nil && len(eval.GetParameters().P()) >= 2 && dIn != nil && dIn.Level() >= 1 {
 			if prod, e := eval.MulNew(dIn, dIn); e == nil && prod.Degree() == 2 {
 				// square tensor (MUL: prod = dIn⊗dIn) + its relin (multi-P key-switch).
@@ -222,12 +236,19 @@ func (eval Evaluator) EvaluateAndScaleNew(ct *rlwe.Ciphertext, scaling complex12
 		// runtime drains the "rs_*" regions on the trailing "rs_meta"; the 2-element
 		// meta [N, inLimbs] selects the plain rescale dump (no BSGS-step edge fields).
 		// Falls back to the untraced Rescale outside capture / multi-prime rescaling.
+		if eval.TraceSink != nil &&
+			!(eval.GetParameters().LevelsConsumedPerRescaling() == 1 && res.Level() >= 1) {
+			fmt.Fprintf(os.Stderr, "[vfhe] WARNING double-angle rescale NOT captured "+
+				"(levelsPerRescale=%d level=%d): its result will be bound to nothing\n",
+				eval.GetParameters().LevelsConsumedPerRescaling(), res.Level())
+		}
 		if eval.TraceSink != nil && eval.GetParameters().LevelsConsumedPerRescaling() == 1 && res.Level() >= 1 {
 			inLimbs := res.Level() + 1
 			if err = eval.RescaleTraced(res, res, mod1PrefixSink{inner: eval.TraceSink, prefix: "rs_"}); err != nil {
 				return nil, fmt.Errorf("cannot Evaluate (rescale traced): %w", err)
 			}
-			eval.TraceSink.Poly("rs_meta", 0, []uint64{uint64(eval.GetParameters().N()), uint64(inLimbs)})
+			eval.TraceSink.Poly("rs_meta", 0, []uint64{uint64(eval.GetParameters().N()),
+				uint64(inLimbs), 0, 0, ring.RsOriginDoubleAngle})
 		} else if err = eval.Rescale(res, res); err != nil {
 			return nil, fmt.Errorf("cannot Evaluate: %w", err)
 		}

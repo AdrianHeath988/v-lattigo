@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
 	"slices"
 
 	ltcommon "github.com/tuneinsight/lattigo/v6/circuits/ckks/lintrans"
 	"github.com/tuneinsight/lattigo/v6/circuits/common/lintrans"
+	"github.com/tuneinsight/lattigo/v6/circuits/common/vfhetrace"
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/ring"
 	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
@@ -255,7 +257,12 @@ func (eval *Evaluator) CoeffsToSlots(ctIn *rlwe.Ciphertext, ctsMatrices Matrix, 
 			return fmt.Errorf("cannot CoeffsToSlots: %w", err)
 		}
 
-		if err = eval.Conjugate(zV, ctReal); err != nil {
+		// vFHE: the conjugate is an AUTOMORPHISM key-switch, and it sits at the head
+		// of the real/imag split -- so with it untraced the whole
+		// CoeffsToSlots -> EvalMod seam was broken at its first op. Routed through
+		// the traced automorphism when capturing, so it lands on the same multi-P
+		// board every other key-switch does.
+		if err = eval.conjugateTraced(zV, ctReal); err != nil {
 			return fmt.Errorf("cannot CoeffsToSlots: %w", err)
 		}
 
@@ -273,25 +280,47 @@ func (eval *Evaluator) CoeffsToSlots(ctIn *rlwe.Ciphertext, ctsMatrices Matrix, 
 		if err = eval.Sub(zV, ctReal, tmp); err != nil {
 			return fmt.Errorf("cannot CoeffsToSlots: %w", err)
 		}
+		// vFHE: SUB is the only op in this block with no pre-existing board (see
+		// gen_board_sub); the rest reuse add / plainop.
+		vfhetrace.EmitLinOp(eval.TraceSink, vfhetrace.OpSUB, zV, ctReal, tmp, nil)
 
+		var preMul *rlwe.Ciphertext
+		if eval.TraceSink != nil {
+			preMul = tmp.CopyNew()
+		}
 		if err = eval.Mul(tmp, -1i, tmp); err != nil {
 			return fmt.Errorf("cannot CoeffsToSlots: %w", err)
 		}
+		if ck := eval.ckksEval(); ck != nil && preMul != nil {
+			vfhetrace.EmitLinOp(eval.TraceSink, vfhetrace.OpPMUL, preMul, nil, tmp,
+				vfhetrace.MulRefPlain(ck, tmp.Level(), tmp.Scale.Div(preMul.Scale), -1i))
+		}
 
 		// Real part
+		var preAdd *rlwe.Ciphertext
+		if eval.TraceSink != nil {
+			preAdd = ctReal.CopyNew()
+		}
 		if err = eval.Add(ctReal, zV, ctReal); err != nil {
 			return fmt.Errorf("cannot CoeffsToSlots: %w", err)
 		}
+		vfhetrace.EmitLinOp(eval.TraceSink, vfhetrace.OpADD, preAdd, zV, ctReal, nil)
 
 		// If repacking, then ct0 and ct1 right n/2 slots are zero.
 		if ctsMatrices.Format == RepackImagAsReal && ctsMatrices.LogSlots < eval.parameters.LogMaxSlots() {
-			if err = eval.Rotate(tmp, 1<<ctIn.LogDimensions.Cols, tmp); err != nil {
+			// vFHE: the repack rotation, likewise a key-switch.
+			if err = eval.rotateTraced(tmp, 1<<ctIn.LogDimensions.Cols); err != nil {
 				return fmt.Errorf("cannot CoeffsToSlots: %w", err)
 			}
 
+			var preRepack *rlwe.Ciphertext
+			if eval.TraceSink != nil {
+				preRepack = ctReal.CopyNew()
+			}
 			if err = eval.Add(ctReal, tmp, ctReal); err != nil {
 				return fmt.Errorf("cannot CoeffsToSlots: %w", err)
 			}
+			vfhetrace.EmitLinOp(eval.TraceSink, vfhetrace.OpADD, preRepack, tmp, ctReal, nil)
 		}
 
 		zV = nil
@@ -330,10 +359,24 @@ func (eval *Evaluator) SlotsToCoeffs(ctReal, ctImag *rlwe.Ciphertext, stcMatrice
 		if err = eval.Mul(ctImag, 1i, opOut); err != nil {
 			return fmt.Errorf("cannot SlotsToCoeffs: %w", err)
 		}
+		// vFHE: the real/imag RECOMBINATION. Untraced, these two ops WERE the
+		// EvalMod -> SlotsToCoeffs seam: they stand between the proven end of
+		// EvalMod and the proven start of the decoding transform, so nothing tied
+		// one to the other. `1i` is a public constant, so the multiply is bound to
+		// the reference it encodes to rather than to the value in the trace.
+		if ck := eval.ckksEval(); ck != nil {
+			vfhetrace.EmitLinOp(eval.TraceSink, vfhetrace.OpPMUL, ctImag, nil, opOut,
+				vfhetrace.MulRefPlain(ck, opOut.Level(), opOut.Scale.Div(ctImag.Scale), 1i))
+		}
 
+		var mixed *rlwe.Ciphertext
+		if eval.TraceSink != nil {
+			mixed = opOut.CopyNew()
+		}
 		if err = eval.Add(opOut, ctReal, opOut); err != nil {
 			return fmt.Errorf("cannot SlotsToCoeffs: %w", err)
 		}
+		vfhetrace.EmitLinOp(eval.TraceSink, vfhetrace.OpADD, mixed, ctReal, opOut, nil)
 
 		if err = eval.dft(opOut, stcMatrices, opOut); err != nil {
 			return fmt.Errorf("cannot SlotsToCoeffs: %w", err)
@@ -390,6 +433,12 @@ func (eval *Evaluator) dft(ctIn *rlwe.Ciphertext, mat Matrix, opOut *rlwe.Cipher
 		// vFHE: capture the per-step rescale (drop a level between matrix levels)
 		// via the instrumented RescaleTraced when tracing + single-prime rescale;
 		// the runtime drains the "rs_*" regions on the trailing "rs_meta".
+		if eval.TraceSink != nil &&
+			!(eval.GetParameters().LevelsConsumedPerRescaling() == 1 && opOut.Level() >= 1) {
+			fmt.Fprintf(os.Stderr, "[vfhe] WARNING DFT step rescale NOT captured "+
+				"(levelsPerRescale=%d level=%d): its result will be bound to nothing\n",
+				eval.GetParameters().LevelsConsumedPerRescaling(), opOut.Level())
+		}
 		if eval.TraceSink != nil && eval.GetParameters().LevelsConsumedPerRescaling() == 1 && opOut.Level() >= 1 {
 			inLimbs := opOut.Level() + 1
 			if err = eval.RescaleTraced(opOut, opOut, dftPrefixSink{inner: eval.TraceSink, prefix: "rs_"}); err != nil {
@@ -402,7 +451,7 @@ func (eval *Evaluator) dft(ctIn *rlwe.Ciphertext, mat Matrix, opOut *rlwe.Cipher
 				pfxFlag = 1
 			}
 			eval.TraceSink.Poly("rs_meta", 0, []uint64{uint64(eval.GetParameters().N()), uint64(inLimbs),
-				uint64(eval.TraceStep - 1), uint64(pfxFlag)})
+				uint64(eval.TraceStep - 1), uint64(pfxFlag), ring.RsOriginDFTStep})
 		} else if err = eval.Rescale(opOut, opOut); err != nil {
 			return
 		}

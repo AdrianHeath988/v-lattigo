@@ -9,6 +9,7 @@ package dft
 import (
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/ring"
+	"github.com/tuneinsight/lattigo/v6/schemes/ckks"
 )
 
 // c2sIdx packs (step, component, limb) into one trace index. step < 256,
@@ -43,4 +44,66 @@ func emitDFTStep(sink ring.TraceSink, pfx string, step int, operand, result *rlw
 			sink.Poly(pfx+"_result", c2sIdx(step, k, i), append([]uint64{}, result.Value[k].Coeffs[i]...))
 		}
 	}
+}
+
+// ckksEval exposes the underlying *ckks.Evaluator, which the scalar-op capture
+// needs to encode a public constant to its reference plaintext. Returns nil when
+// tracing is off or the evaluator is some other implementation, so every call
+// site degrades to "no reference" rather than to a panic.
+func (eval *Evaluator) ckksEval() *ckks.Evaluator {
+	if eval.TraceSink == nil {
+		return nil
+	}
+	return eval.Evaluator
+}
+
+// ksTraced runs one automorphism through the traced path and closes it with the
+// "ks_meta" trigger the runtime drains on. AutomorphismMultiPTraced emits the
+// whole board (c_in, the grouped key-switch, the mod-down, result, idx); only the
+// meta -- which carries the shape the assembler needs -- is the caller's.
+//
+// BEST-EFFORT: capture must never change the result, so any failure falls back to
+// the production call. That keeps a missing Galois key or an unsupported levelP
+// from turning a working bootstrap into a broken one; the op then shows up as an
+// absent proof rather than a wrong answer.
+func (eval *Evaluator) ksTraced(ctIn *rlwe.Ciphertext, galEl uint64,
+	opOut *rlwe.Ciphertext) error {
+	params := eval.parameters
+	levelP := params.MaxLevelP()
+	if eval.TraceSink == nil || levelP < 1 {
+		return eval.Automorphism(ctIn, galEl, opOut)
+	}
+	sink := dftPrefixSink{inner: eval.TraceSink, prefix: "ks_"}
+	if err := eval.AutomorphismMultiPTraced(ctIn, galEl, opOut, sink); err != nil {
+		return eval.Automorphism(ctIn, galEl, opOut)
+	}
+	level := opOut.Level()
+	eval.TraceSink.Poly("ks_meta", 0, []uint64{
+		uint64(params.N()), uint64(level + 1), uint64(levelP + 1),
+		uint64(params.BaseRNSDecompositionVectorSize(level, levelP)), galEl})
+	return nil
+}
+
+// conjugateTraced is Conjugate with the key-switch captured.
+func (eval *Evaluator) conjugateTraced(ctIn, opOut *rlwe.Ciphertext) error {
+	if eval.TraceSink == nil {
+		return eval.Conjugate(ctIn, opOut)
+	}
+	return eval.ksTraced(ctIn, eval.parameters.GaloisElementOrderTwoOrthogonalSubgroup(), opOut)
+}
+
+// rotateTraced is an IN-PLACE Rotate with the key-switch captured. The
+// automorphism permutes, so it cannot be done in place: the traced path writes to
+// a fresh ciphertext and the result is copied back, matching what Rotate does
+// internally.
+func (eval *Evaluator) rotateTraced(ct *rlwe.Ciphertext, k int) error {
+	if eval.TraceSink == nil {
+		return eval.Rotate(ct, k, ct)
+	}
+	out := ckks.NewCiphertext(eval.parameters, 1, ct.Level())
+	if err := eval.ksTraced(ct, eval.parameters.GaloisElement(k), out); err != nil {
+		return err
+	}
+	ct.Copy(out)
+	return nil
 }

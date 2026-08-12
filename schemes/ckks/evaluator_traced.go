@@ -249,5 +249,90 @@ func (eval Evaluator) AutomorphismMultiPTraced(ctIn *rlwe.Ciphertext, galEl uint
 			sink.Poly("result", k*L+l, opOut.Value[k].Coeffs[l])
 		}
 	}
+	// The output automorphism the board bakes. Without it assembleKSBuffer falls
+	// back to the IDENTITY index, which is right for a bare key-switch and wrong
+	// for every rotation -- the self-check would then compare the permuted result
+	// against an unpermuted one. It is emitted here rather than by each caller
+	// because it is a function of galEl and N, which this already computed.
+	idxU := make([]uint64, N)
+	copy(idxU, idx)
+	sink.Poly("idx", 0, idxU)
+	return nil
+}
+
+// RescaleToTraced is RescaleTo with every dropped level proved.
+//
+// RescaleTo drops n levels in ONE pass -- a single iNTT, n divide-and-rounds in
+// the coefficient domain, a single NTT back -- so the eval-domain intermediates
+// never exist and there is nothing for the per-level rescale board to bind. This
+// performs the same reduction as n SINGLE-level rescales instead, each one going
+// through RescaleTraced, so each dropped prime gets a board and what is proved is
+// what production computed.
+//
+// The two are mathematically identical: the NTT and its inverse are exact on
+// canonical residues, so inserting round-trips between the divide-and-rounds
+// changes nothing but the work done. It is n-1 extra round-trips in a step that
+// runs once per bootstrap.
+//
+// The target-level computation is RescaleTo's, unchanged: divide by moduli from
+// the top down while the resulting scale stays at or above minScale/2, and never
+// past level 0.
+func (eval Evaluator) RescaleToTraced(op0 *rlwe.Ciphertext, minScale rlwe.Scale,
+	opOut *rlwe.Ciphertext, sink ring.TraceSink) (err error) {
+
+	if op0.MetaData == nil || opOut.MetaData == nil {
+		return fmt.Errorf("cannot RescaleToTraced: op0.MetaData or opOut.MetaData is nil")
+	}
+	if minScale.Cmp(rlwe.NewScale(0)) != 1 {
+		return fmt.Errorf("cannot RescaleToTraced: minScale is <0")
+	}
+	if op0.Scale.Cmp(rlwe.NewScale(0)) != 1 {
+		return fmt.Errorf("cannot RescaleToTraced: ciphertext scale is <0")
+	}
+	if op0.Level() == 0 {
+		return fmt.Errorf("cannot RescaleToTraced: input Ciphertext already at level 0")
+	}
+	// Without a sink there is nothing to gain from the slower path.
+	if sink == nil || eval.GetParameters().LevelsConsumedPerRescaling() != 1 {
+		return eval.RescaleTo(op0, minScale, opOut)
+	}
+
+	half := minScale.Div(rlwe.NewScale(2))
+	ringQ := eval.GetParameters().RingQ().AtLevel(op0.Level())
+
+	// How many levels RescaleTo would drop, decided before anything is mutated.
+	nbRescales, level, scale := 0, op0.Level(), op0.Scale
+	for level >= 0 {
+		next := scale.Div(rlwe.NewScale(ringQ.SubRings[level].Modulus))
+		if next.Cmp(half) == -1 {
+			break
+		}
+		scale = next
+		level--
+		nbRescales++
+		if level == 0 {
+			break
+		}
+	}
+
+	if op0 != opOut {
+		opOut.Resize(op0.Degree(), op0.Level())
+		opOut.Copy(op0)
+	}
+	*opOut.MetaData = *op0.MetaData
+
+	for i := 0; i < nbRescales; i++ {
+		if err = eval.RescaleTraced(opOut, opOut, sink); err != nil {
+			return fmt.Errorf("cannot RescaleToTraced (level %d of %d): %w",
+				i+1, nbRescales, err)
+		}
+		// RescaleTraced emits the regions; the trailing meta is what the runtime
+		// drains on, and it carries the pre-rescale limb count.
+		// The trailing element is the ORIGIN TAG (ring.RsOriginScaleDown): which of the
+		// bootstrap's four rescale sites this is. Without it an unbound rescale operand
+		// names no stage and the only way to find its producer is to guess.
+		sink.Poly("rs_meta", 0, []uint64{uint64(ringQ.N()), uint64(opOut.Level() + 2),
+			0, 0, ring.RsOriginScaleDown})
+	}
 	return nil
 }
