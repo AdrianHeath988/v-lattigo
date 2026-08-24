@@ -827,10 +827,23 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 
 		ringQ.NTT(ctIn.Value[0], ctIn.Value[0])
 
+		// vFHE: this key-switch performs no gadget DECOMPOSITION. buffDecompQP[i]
+		// is set to NTT(buffDecompQP[0]) above and then scaled by the scalar
+		// below, so every "digit" is the SAME polynomial: the centered q0 lift
+		// times that scalar, i.e. |digit| <= scalar*(q0>>1). Real key-switch
+		// digits are bounded by their digit group's prime product, and the
+		// prover's digit board sizes its range proof from exactly that -- which
+		// for the ragged last group is a single prime and cannot hold this value.
+		// Emit the true bound so the board is built against what ModUp actually
+		// produces rather than an assumption it does not satisfy. Kept OUT of
+		// ks_meta deliberately: a fifth meta field is read as the Galois element
+		// (len(meta) >= 5), which would retag every digit shape of this switch.
+		modupDigitScalar := uint64(1)
 		// Scale the message from Q0/|m| to QL/|m|, where QL is the largest modulus used during the bootstrapping.
 		if scale := (eval.Mod1Parameters.ScalingFactor().Float64() / eval.Mod1Parameters.MessageRatio()) / ctIn.Scale.Float64(); scale > 1 {
 
 			scalar := uint64(math.Round(scale))
+			modupDigitScalar = scalar
 
 			for i := len(buffDecompQP) - 1; i >= 0; i-- {
 				ringQ.MulScalar(buffDecompQP[0].Q, scalar, buffDecompQP[i].Q)
@@ -899,6 +912,11 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 					}
 				}
 				d := eval.BootstrappingParameters.Parameters.BaseRNSDecompositionVectorSize(levelQ, levelP)
+				// BEFORE ks_meta: ks_meta is the flush trigger, so anything the
+				// drain needs must already be in the sink. q is Q[0], the prime
+				// the centered lift above is taken around.
+				eval.TraceSink.Poly("ks_digit_bound", 0,
+					[]uint64{modupDigitScalar * (q >> 1)})
 				eval.TraceSink.Poly("ks_meta", 0, []uint64{
 					uint64(ringQ.N()), uint64(levelQ + 1), uint64(levelP + 1), uint64(d)})
 			}
