@@ -845,12 +845,32 @@ func (eval Evaluator) ModUp(ctIn *rlwe.Ciphertext) (ctOut *rlwe.Ciphertext, err 
 			scalar := uint64(math.Round(scale))
 			modupDigitScalar = scalar
 
+			// vFHE: the V[1] DIGIT SCALING, captured as the plaintext multiply it is.
+			// Every "digit" the hoisted key-switch below decomposes is scalar * NTT(lift
+			// of c1), and without a board for this multiply the switched polynomial the
+			// digit boards bind to was produced by nothing: the key-switch proved a
+			// statement about a value the prover chose. One polynomial over the Q primes
+			// (the digit boards publish the switched polynomial at the Q factors; its P
+			// residues are tied to those through the shared digit bits). Snapshot first:
+			// the multiply is in place into buffDecompQP[0].
+			var digBefore ring.Poly
+			if eval.TraceSink != nil {
+				digBefore = ringQ.NewPoly()
+				digBefore.CopyLvl(levelQ, buffDecompQP[0].Q)
+			}
+
 			for i := len(buffDecompQP) - 1; i >= 0; i-- {
 				ringQ.MulScalar(buffDecompQP[0].Q, scalar, buffDecompQP[i].Q)
 			}
 
 			for i := len(buffDecompQP) - 1; i >= 0; i-- {
 				ringP.MulScalar(buffDecompQP[0].P, scalar, buffDecompQP[i].P)
+			}
+
+			if eval.TraceSink != nil {
+				vfhetrace.EmitPolyOp(eval.TraceSink, vfhetrace.OpPMUL, levelQ+1,
+					[]ring.Poly{digBefore}, nil, []ring.Poly{buffDecompQP[0].Q},
+					vfhetrace.ScalarBroadcastRef(scalar, Q, levelQ+1, N))
 			}
 
 			// vFHE: the message-ratio scaling. A pointwise multiply by a PUBLIC

@@ -59,7 +59,7 @@ func (p prefixSink) Stage(region string, idx, stage int, vals []uint64) {
 // drains + dumps on that meta). Re-runs the key-switch under instrumentation (the
 // production baby rotation is hoisted; the math is identical) — BEST-EFFORT: a
 // failure logs and returns, never aborting the real bootstrap.
-func (eval Evaluator) captureKSRotation(c0, c1 ring.Poly, galEl uint64, evk *rlwe.GaloisKey, levelQ, levelP, step, gs, babyIdx int) {
+func (eval Evaluator) captureKSRotation(c0, c1 ring.Poly, c0P *ring.Poly, galEl uint64, evk *rlwe.GaloisKey, levelQ, levelP, step, gs, babyIdx int) {
 	if eval.TraceSink == nil || levelP < 1 || evk == nil {
 		return
 	}
@@ -72,6 +72,14 @@ func (eval Evaluator) captureKSRotation(c0, c1 ring.Poly, galEl uint64, evk *rlw
 	for l := 0; l <= levelQ; l++ {
 		ks.Poly("c_in", 0*Lq+l, append([]uint64{}, c0.Coeffs[l]...))
 		ks.Poly("c_in", 1*Lq+l, zero)
+	}
+	// vFHE: a GIANT step's additive input is tmp0 in QP, and the accumulate operand
+	// it forms (KS_lazy(tmp1) + tmp0) is proved over the P primes too -- so its P
+	// half rides along (the runtime appends it to the buffer as a trailer).
+	if c0P != nil {
+		for v := 0; v <= levelP && v < len(c0P.Coeffs); v++ {
+			ks.Poly("c_inP", v, append([]uint64{}, c0P.Coeffs[v]...))
+		}
 	}
 	ksCt := rlwe.NewCiphertext(params, 1, levelQ)
 	ksCt.MetaData.IsNTT = true
@@ -165,6 +173,13 @@ func (eval Evaluator) captureModDownP(p1Q, p1P, p2Q ring.Poly, comp, nComp, leve
 	N := len(p1Q.Coeffs[0])
 	for l := 0; l <= levelQ; l++ {
 		mdp.Poly("prod", comp*Lq+l, append([]uint64{}, p1Q.Coeffs[l]...))
+	}
+	// The P-basis half of the input (NTT form), captured BEFORE the mod-down reads
+	// it. The P factors of the ÷P proof take it as their boundary operand and prove
+	// md_advice = iNTT(prodP) against it; without it the P-side residue -- and so
+	// the integer every Q limb divides out -- was advice tied to nothing.
+	for v := 0; v <= levelP; v++ {
+		mdp.Poly("prodP", comp*(levelP+1)+v, append([]uint64{}, p1P.Coeffs[v]...))
 	}
 	eval.ModDownQPtoQNTTMultiPTraced(comp, levelQ, levelP, p1Q, p1P, p2Q, Lq, levelP+1, mdp)
 	if last {
@@ -265,7 +280,7 @@ func (eval Evaluator) PreRotatedCiphertextForDiagonalMatrixMultiplication(levelQ
 				if bevk, e := eval.CheckAndGetGaloisKey(params.GaloisElement(i)); e == nil {
 					// gs=-1: baby rotation (no inner-sum ÷P feeds it). babyIdx=i = the
 					// rotation index, so the inner sum can bind in_di == ctPreRot[i].
-					eval.captureKSRotation(ctIn.Value[0], ctIn.Value[1], params.GaloisElement(i), bevk, levelQ, levelP, eval.TraceStep, -1, i)
+					eval.captureKSRotation(ctIn.Value[0], ctIn.Value[1], nil, params.GaloisElement(i), bevk, levelQ, levelP, eval.TraceStep, -1, i)
 				}
 				// FAITHFUL op-to-op edge: capture the production baby-rotation OUTPUT
 				// (this exact ctPreRot[i]) so the inner sum binds in_di == ctPreRot[i].
@@ -627,7 +642,7 @@ func (eval Evaluator) MultiplyByDiagMatrixBSGS(ctIn *rlwe.Ciphertext, matrix Lin
 			// rotation by the runtime (flushKS on the trailing "ks_meta"), so all
 			// giant-steps of all matrix steps are traced without unbounded memory.
 			if eval.TraceSink != nil {
-				eval.captureKSRotation(tmp0QP.Q, tmp1QP.Q, galEl, evk, levelQ, levelP, eval.TraceStep, cnt0, -1)
+				eval.captureKSRotation(tmp0QP.Q, tmp1QP.Q, &tmp0QP.P, galEl, evk, levelQ, levelP, eval.TraceStep, cnt0, -1)
 			}
 
 			// EvaluationKey(P*phi(tmpRes_1)) = (d0, d1) in base QP
@@ -641,7 +656,8 @@ func (eval Evaluator) MultiplyByDiagMatrixBSGS(ctIn *rlwe.Ciphertext, matrix Lin
 			// and its automorphism index, BEFORE the rotate+accumulate below.
 			if eval.TraceSink != nil {
 				emitLinTransGiant(eval.TraceSink, eval.TracePrefix, eval.TraceStep, cnt0,
-					ringQ, cQP.Value[0].Q, cQP.Value[1].Q, rotIndex, false)
+					ringQ, ringP, cQP.Value[0].Q, cQP.Value[1].Q, cQP.Value[0].P, cQP.Value[1].P,
+					rotIndex, false)
 			}
 
 			// Outer loop rotations
@@ -658,7 +674,7 @@ func (eval Evaluator) MultiplyByDiagMatrixBSGS(ctIn *rlwe.Ciphertext, matrix Lin
 			// vFHE: j==0 giant-step is the identity automorphism of (tmp0, tmp1).
 			if eval.TraceSink != nil {
 				emitLinTransGiant(eval.TraceSink, eval.TracePrefix, eval.TraceStep, cnt0,
-					ringQ, tmp0QP.Q, tmp1QP.Q, nil, true)
+					ringQ, ringP, tmp0QP.Q, tmp1QP.Q, tmp0QP.P, tmp1QP.P, nil, true)
 			}
 			if cnt0 == 0 {
 				c0OutQP.CopyLvl(levelQ, levelP, tmp0QP)
@@ -696,7 +712,7 @@ func (eval Evaluator) MultiplyByDiagMatrixBSGS(ctIn *rlwe.Ciphertext, matrix Lin
 	// final ÷P mod-down, so the giant-step permutation+accumulate can be checked.
 	if eval.TraceSink != nil {
 		emitLinTransGiantOut(eval.TraceSink, eval.TracePrefix, eval.TraceStep,
-			ringQ, opOut.Value[0], opOut.Value[1], cnt0)
+			ringQ, ringP, opOut.Value[0], opOut.Value[1], c0OutQP.P, c1OutQP.P, cnt0)
 	}
 
 	// vFHE: trace the FINAL accumulate ÷P (both components, QP→Q) — the reduction

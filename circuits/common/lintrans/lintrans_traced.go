@@ -164,20 +164,29 @@ func ltgCoutBase(step, comp int) int    { return step*2 + comp }
 // emitLinTransGiant captures one giant-step's rotate input cQP_j + its
 // automorphism index (nil ⇒ identity, j==0). c0Q/c1Q are the two components' Q
 // polys (lazy; reduced here).
+//
+// The P half (c0P/c1P over ringP) is captured too, under "ltg<pfx>_cqpP": the
+// accumulate runs in QP and its P limbs feed the final ÷P mod-down's P factors, so
+// the permute-accumulate is proved per P prime as well.
 func emitLinTransGiant(sink ring.TraceSink, pfx string, step, gs int,
-	ringQ *ring.Ring, c0Q, c1Q ring.Poly, idx []uint64, identity bool) {
+	ringQ, ringP *ring.Ring, c0Q, c1Q, c0P, c1P ring.Poly, idx []uint64, identity bool) {
 
-	level := ringQ.Level()
-	buf := ringQ.NewPoly()
-	emit := func(comp int, src ring.Poly) {
-		ringQ.Reduce(src, buf)
+	emitIn := func(rng *ring.Ring, region string, comp int, src ring.Poly) {
+		if rng == nil || src.Level() < 0 {
+			return
+		}
+		level := rng.Level()
+		buf := rng.NewPoly()
+		rng.Reduce(src, buf)
 		for l := 0; l <= level; l++ {
-			sink.Poly("ltg"+pfx+"_cqp", ltgCqpBase(step, gs, comp)*ltMaxLimb+l,
+			sink.Poly(region, ltgCqpBase(step, gs, comp)*ltMaxLimb+l,
 				append([]uint64{}, buf.Coeffs[l]...))
 		}
 	}
-	emit(0, c0Q)
-	emit(1, c1Q)
+	emitIn(ringQ, "ltg"+pfx+"_cqp", 0, c0Q)
+	emitIn(ringQ, "ltg"+pfx+"_cqp", 1, c1Q)
+	emitIn(ringP, "ltg"+pfx+"_cqpP", 0, c0P)
+	emitIn(ringP, "ltg"+pfx+"_cqpP", 1, c1P)
 
 	N := ringQ.N()
 	id := make([]uint64, N)
@@ -195,18 +204,29 @@ func emitLinTransGiant(sink ring.TraceSink, pfx string, step, gs int,
 // lazy → reduced) after the giant-step loop, BEFORE the final ÷P mod-down. nGS is
 // the giant-step count for this matrix step.
 func emitLinTransGiantOut(sink ring.TraceSink, pfx string, step int,
-	ringQ *ring.Ring, c0Q, c1Q ring.Poly, nGS int) {
+	ringQ, ringP *ring.Ring, c0Q, c1Q, c0P, c1P ring.Poly, nGS int) {
 
-	level := ringQ.Level()
-	buf := ringQ.NewPoly()
-	emit := func(comp int, src ring.Poly) {
-		ringQ.Reduce(src, buf)
+	emit := func(rng *ring.Ring, region string, comp int, src ring.Poly) {
+		if rng == nil || src.Level() < 0 {
+			return
+		}
+		level := rng.Level()
+		buf := rng.NewPoly()
+		rng.Reduce(src, buf)
 		for l := 0; l <= level; l++ {
-			sink.Poly("ltg"+pfx+"_cout", ltgCoutBase(step, comp)*ltMaxLimb+l,
+			sink.Poly(region, ltgCoutBase(step, comp)*ltMaxLimb+l,
 				append([]uint64{}, buf.Coeffs[l]...))
 		}
 	}
-	emit(0, c0Q)
-	emit(1, c1Q)
-	sink.Poly("ltg"+pfx+"_gmeta", step, []uint64{uint64(nGS), uint64(level)})
+	emit(ringQ, "ltg"+pfx+"_cout", 0, c0Q)
+	emit(ringQ, "ltg"+pfx+"_cout", 1, c1Q)
+	// The P half: the final ÷P mod-down's P-side operand (see emitLinTransGiant).
+	levelP := -1
+	if ringP != nil {
+		emit(ringP, "ltg"+pfx+"_coutP", 0, c0P)
+		emit(ringP, "ltg"+pfx+"_coutP", 1, c1P)
+		levelP = ringP.Level()
+	}
+	sink.Poly("ltg"+pfx+"_gmeta", step, []uint64{uint64(nGS), uint64(ringQ.Level()),
+		uint64(int64(levelP))})
 }
